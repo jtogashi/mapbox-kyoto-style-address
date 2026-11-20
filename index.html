@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>京都 通り名住所マップ</title>
+  <link href="https://api.mapbox.com/mapbox-gl-js/v3.35.1/mapbox-gl.css" rel="stylesheet" />
+  <script src="https://api.mapbox.com/mapbox-gl-js/v3.35.1/mapbox-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@7.4.0/turf.min.js"></script>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; }
+    #map { position: absolute; inset: 0; }
+    #panel {
+      position: absolute; top: 12px; left: 12px; z-index: 1;
+      width: min(340px, calc(100vw - 24px)); padding: 12px;
+      background: #fff; border-radius: 8px; box-shadow: 0 2px 8px #0003;
+    }
+    #search { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    #search input, #search select, #search button { min-width: 0; padding: 6px; font-size: 15px; }
+    #result { margin-top: 10px; font-size: 18px; font-weight: bold; }
+    #status { margin-top: 4px; font-size: 12px; color: #666; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <form id="search">
+      <input id="street" list="street-names" placeholder="通り（例: 烏丸通）" />
+      <input id="cross" list="street-names" placeholder="通り（例: 四条通）" />
+      <select id="dir">
+        <option value="">交差点</option>
+        <option>上ル</option>
+        <option>下ル</option>
+        <option>東入ル</option>
+        <option>西入ル</option>
+      </select>
+      <button>検索</button>
+    </form>
+    <datalist id="street-names"></datalist>
+    <div id="result"></div>
+    <div id="status">通りデータを読み込み中…</div>
+  </div>
+
+  <script type="module">
+    import { VectorTile } from "https://esm.sh/@mapbox/vector-tile@3.0.0";
+    import { PbfReader } from "https://esm.sh/pbf@5.2.0";
+    // Mapbox public token: copy config.example.js to config.js and set your own
+    import { MAPBOX_TOKEN } from "./config.js";
+
+    const TOKEN = MAPBOX_TOKEN;
+    mapboxgl.accessToken = TOKEN;
+
+    // Area to fetch tiles for: Saga-Arashiyama to Shishigatani-dori (W-E),
+    // Jujo-dori to Kokusaikaikan (S-N).
+    // Whole z14 tiles are loaded, so the streets actually cover a bit more than this.
+    const BBOX = [135.675, 34.963, 135.797, 35.068]; // [west, south, east, north]
+    const Z = 14;
+
+    // Customary names used in addresses: name in data -> name in addresses
+    const ADDRESS_NAMES = { "東大路通": "東山通" };
+    const addrName = (name) => ADDRESS_NAMES[name] ?? name; // "東山通"
+    // Drop "通" in addresses ("東山通" -> "東山"); names ending with "道" stay as is ("太子道")
+    const shortName = (name) => addrName(name).replace(/通$/, "");
+
+    // ------------------------------------------------------------
+    // 1. Build street lines from Mapbox Vector Tiles
+    // ------------------------------------------------------------
+
+    // lon/lat -> XYZ tile index
+    const lon2x = (lon) => Math.floor(((lon + 180) / 360) * 2 ** Z);
+    const lat2y = (lat) => {
+      const r = (lat * Math.PI) / 180;
+      return Math.floor(((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2) * 2 ** Z);
+    };
+
+    // Wider roads first: the index is used as a rough rank of road width
+    const ROAD_CLASSES = ["trunk", "primary", "secondary", "tertiary", "street", "street_limited"];
+
+    // Named intersections in the tiles, e.g. { name: "四条烏丸", point }
+    const junctions = [];
+
+    async function loadStreets() {
+      const lines = {}; // name -> array of LineString coordinates
+      const ranks = {}; // name -> best (smallest) index in ROAD_CLASSES
+      const jobs = [];
+      for (let x = lon2x(BBOX[0]); x <= lon2x(BBOX[2]); x++) {
+        for (let y = lat2y(BBOX[3]); y <= lat2y(BBOX[1]); y++) {
+          jobs.push(loadTile(x, y, lines, ranks));
+        }
+      }
+      await Promise.all(jobs);
+
+      // name -> { name, geom: MultiLineString, rank, length }
+      const streets = {};
+      for (const [name, coords] of Object.entries(lines)) {
+        const geom = turf.multiLineString(coords, { name });
+        streets[name] = { name, geom, rank: ranks[name], length: turf.length(geom) };
+      }
+      return streets;
+    }
+
+    async function loadTile(x, y, lines, ranks) {
+      const url = `https://api.mapbox.com/v4/mapbox.mapbox-streets-v8/${Z}/${x}/${y}.vector.pbf?access_token=${TOKEN}`;
+      const buf = await (await fetch(url)).arrayBuffer();
+      const road = new VectorTile(new PbfReader(new Uint8Array(buf))).layers.road;
+      if (!road) return;
+      for (let i = 0; i < road.length; i++) {
+        const f = road.feature(i);
+        const { class: cls, name_ja } = f.properties;
+
+        // Intersection names are point features with class "intersection"
+        if (cls === "intersection" && name_ja) {
+          junctions.push({ name: name_ja, point: f.toGeoJSON(x, y, Z) });
+          continue;
+        }
+
+        // Normalize names: drop a trailing alias in parentheses ("十条通(鳥羽通)" -> "十条通")
+        // and turn "通り" into "通" ("葛野大路通り" -> "葛野大路通")
+        const name = name_ja?.replace(/[(（][^)）]*[)）]$/, "").replace(/通り$/, "通");
+        // Keep only named roads whose name ends with "通" or "道" (e.g. 四条通, 太子道)
+        if (!/[通道]$/.test(name ?? "") || !ROAD_CLASSES.includes(cls)) continue;
+
+        const g = f.toGeoJSON(x, y, Z).geometry;
+        const parts = g.type === "LineString" ? [g.coordinates] : g.coordinates;
+        (lines[name] ??= []).push(...parts.filter((p) => p.length >= 2));
+        ranks[name] = Math.min(ranks[name] ?? Infinity, ROAD_CLASSES.indexOf(cls));
+      }
+    }
+
+    // ------------------------------------------------------------
+    // 2. Intersections between streets
+    // ------------------------------------------------------------
+
+    // Angle difference in degrees, 0..180
+    const angleDiff = (a, b) => Math.abs(((a - b + 540) % 360) - 180);
+
+    // Direction of the street around point p (streets are not always N-S / E-W)
+    function localBearing(street, p) {
+      const { multiFeatureIndex: i, segmentIndex: j } = turf.nearestPointOnLine(street.geom, p).properties;
+      const line = street.geom.geometry.coordinates[i];
+      const k = Math.min(j, line.length - 2); // j can point at the last vertex
+      return turf.bearing(line[k], line[k + 1]);
+    }
+
+    // Crossing angle of two streets at p, 0..90
+    function crossAngle(a, b, p) {
+      const d = angleDiff(localBearing(a, p), localBearing(b, p));
+      return Math.min(d, 180 - d);
+    }
+
+    // Merge points closer than 100 m (divided roads, tile-boundary duplicates)
+    function cluster(points) {
+      const groups = [];
+      for (const p of points) {
+        const g = groups.find((g) => turf.distance(g[0], p) < 0.1);
+        g ? g.push(p) : groups.push([p]);
+      }
+      return groups.map((g) => turf.center(turf.featureCollection(g)));
+    }
+
+    // Line ends of `from` that touch `to` within 10 m (T-junctions).
+    // Tile coordinates are quantized, so such ends rarely lie exactly on the other line.
+    function touches(from, to) {
+      return from.geom.geometry.coordinates
+        .flatMap((line) => [line[0], line[line.length - 1]])
+        .map((end) => turf.nearestPointOnLine(to.geom, end))
+        .filter((p) => p.properties.dist < 0.01);
+    }
+
+    // Intersection points of two streets
+    function intersect(a, b) {
+      const [aw, as, ae, an] = turf.bbox(a.geom);
+      const [bw, bs, be, bn] = turf.bbox(b.geom);
+      if (aw > be || bw > ae || as > bn || bs > an) return []; // quick reject
+      return cluster([
+        ...turf.lineIntersect(a.geom, b.geom).features,
+        ...touches(a, b),
+        ...touches(b, a),
+      ]).filter((p) => crossAngle(a, b, p) > 20); // ignore roads that merge or run side by side
+    }
+
+    // All crossings on a street with other streets: [{ name, point }]
+    const crossingCache = {};
+    function crossingsOf(street) {
+      return (crossingCache[street.name] ??= Object.values(streets)
+        .filter((s) => s !== street)
+        .flatMap((s) => intersect(street, s).map((point) => ({ name: s.name, point }))));
+    }
+
+    // Path along a street from point a to point b. A street is split into many
+    // short parts (tile boundaries, OSM ways), so hop from part to part with lineSlice.
+    function pathAlong(street, a, b) {
+      const parts = street.geom.geometry.coordinates.map((c) => turf.lineString(c));
+      const used = new Set();
+      const coords = [];
+      let cur = a;
+      for (let step = 0; step < 50; step++) {
+        // Nearest unused part within 15 m of the current point
+        let best = null;
+        parts.forEach((part, i) => {
+          const d = used.has(i) ? Infinity : turf.pointToLineDistance(cur, part);
+          if (d < 0.015 && (!best || d < best.d)) best = { i, d };
+        });
+        if (!best) break;
+        used.add(best.i);
+        const stop = turf.nearestPointOnLine(parts[best.i], b);
+        coords.push(...turf.lineSlice(cur, stop, parts[best.i]).geometry.coordinates);
+        if (turf.distance(stop, b) < 0.015) return turf.lineString(coords);
+        cur = stop;
+      }
+      return turf.lineString([a.geometry.coordinates, b.geometry.coordinates]); // fallback
+    }
+
+    // Name of a crossing: the intersection name in the tiles if one is within 40 m
+    // (e.g. "四条烏丸"); otherwise both names without "通", wider street first
+    function crossingName(a, b, point) {
+      const near = junctions
+        .map((j) => ({ ...j, d: turf.distance(point, j.point) }))
+        .filter((j) => j.d < 0.04)
+        .sort((j1, j2) => j1.d - j2.d)[0];
+      if (near) return near.name;
+      const [first, second] = [a, b].sort((s1, s2) => s1.rank - s2.rank || s2.length - s1.length);
+      return shortName(first.name) + shortName(second.name);
+    }
+
+    // ------------------------------------------------------------
+    // 3. Forward: street names (+ direction) -> place on the map
+    // ------------------------------------------------------------
+
+    // Directions used in addresses, as compass bearings
+    const DIRS = [
+      { label: "上ル", bearing: 0 },
+      { label: "下ル", bearing: 180 },
+      { label: "東入ル", bearing: 90 },
+      { label: "西入ル", bearing: -90 },
+    ];
+
+    // Street by name, with or without "通" / "通り" (e.g. "烏丸", "烏丸通", "東山")
+    function findStreet(text) {
+      const key = text.trim().replace(/通り?$/, "");
+      return Object.values(streets).find((s) => s.name.replace(/通$/, "") === key || shortName(s.name) === key);
+    }
+
+    // Bearing to go from crossing x along the street toward dir, or null if the
+    // street does not run (or continue) that way. Of the two ways along the street,
+    // take the one closest to dir: on diagonal streets "上ル" means "the more northward way".
+    function alongBearing(street, x, dir) {
+      const sb = localBearing(street, x);
+      const along = [sb, sb + 180].sort((a, b) => angleDiff(a, dir.bearing) - angleDiff(b, dir.bearing))[0];
+      const ahead = turf.destination(x, 0.03, along);
+      if (angleDiff(along, dir.bearing) > 60) return null; // the street runs the other way
+      if (turf.nearestPointOnLine(street.geom, ahead).properties.dist > 0.015) return null; // dead end
+      return along;
+    }
+
+    // streetText / crossText: the two street names, in either order,
+    // dirLabel: one of DIRS labels, or "" for the crossing itself
+    function forward(streetText, crossText, dirLabel) {
+      if (!Object.keys(streets).length) return; // still loading
+      let street = findStreet(streetText);
+      let cross = findStreet(crossText);
+      if (!street || !cross) return show(null, `「${street ? crossText : streetText}」という通りが見つかりません`);
+
+      const [x] = intersect(street, cross);
+      if (!x) return show(null, `${addrName(street.name)}と${addrName(cross.name)}は交差していません`);
+
+      // No direction: just the crossing
+      const dir = DIRS.find((d) => d.label === dirLabel);
+      if (!dir) {
+        return show({ streets: [street.geom, cross.geom], crossing: x, place: x },
+          `${crossingName(street, cross, x)}（交差点）`);
+      }
+      // The place faces the street that runs in the chosen direction. Try the order
+      // as entered first, then swap (e.g. 三条 + 堀川 + 下ル -> 堀川通三条下ル).
+      let along = alongBearing(street, x, dir);
+      if (along === null) {
+        along = alongBearing(cross, x, dir);
+        if (along === null) {
+          return show(null, `${addrName(street.name)}も${addrName(cross.name)}も、交点から${dir.label}方向には続いていません`);
+        }
+        [street, cross] = [cross, street];
+      }
+      const label = `${addrName(street.name)}${shortName(cross.name)}${dir.label}`;
+
+      // Next crossing in that direction = the end of the block
+      const next = crossingsOf(street)
+        .filter((c) => turf.distance(x, c.point) > 0.02)
+        .filter((c) => angleDiff(turf.bearing(x, c.point), along) < 45)
+        .sort((c1, c2) => turf.distance(x, c1.point) - turf.distance(x, c2.point))[0];
+
+      // Fallback: about 100 m ahead if no further crossing is found
+      const end = next ? next.point : turf.nearestPointOnLine(street.geom, turf.destination(x, 0.1, along));
+      const block = pathAlong(street, x, end);
+
+      show({
+        streets: [street.geom, cross.geom],
+        block,
+        crossing: x,
+        place: turf.along(block, turf.length(block) / 2),
+      }, label + (next ? `（${shortName(next.name)}まで）` : ""));
+    }
+
+    // ------------------------------------------------------------
+    // 4. Reverse: clicked point -> address
+    // ------------------------------------------------------------
+
+    const AT_CROSSING = 0.025; // km: a click this close to a crossing = the crossing itself
+    const ON_STREET = 0.015;   // km: a click this close to a street = on the street
+    const MAX_DIST = 0.15;     // km: farther than this = no street nearby
+
+    // Mapbox reverse geocoding: town name (町名, e.g. "元法然寺町") and the
+    // routable point of the nearest address (where the building meets the road)
+    async function geocode(p) {
+      const [lng, lat] = p.geometry.coordinates;
+      const url = `https://api.mapbox.com/search/geocode/v6/reverse?longitude=${lng}&latitude=${lat}&types=address,locality&language=ja&access_token=${TOKEN}`;
+      const { features } = await (await fetch(url)).json();
+      const find = (type) => features.find((f) => f.properties.feature_type === type)?.properties;
+      const rp = find("address")?.coordinates.routable_points?.[0];
+      return {
+        town: find("locality")?.name ?? "",
+        routable: rp ? turf.point([rp.longitude, rp.latitude]) : null,
+      };
+    }
+
+    // Facing street (= nearest street), reference crossing and direction for a point
+    function locate(p) {
+      let facing = null;
+      for (const s of Object.values(streets)) {
+        const snapped = turf.nearestPointOnLine(s.geom, p);
+        if (!facing || snapped.properties.dist < facing.snapped.properties.dist) facing = { street: s, snapped };
+      }
+      if (!facing || facing.snapped.properties.dist > MAX_DIST) return null;
+
+      // Reference crossing = nearest crossing along the facing street
+      const { street, snapped } = facing;
+      const cross = crossingsOf(street)
+        .sort((c1, c2) => turf.distance(snapped, c1.point) - turf.distance(snapped, c2.point))[0];
+      if (!cross) return null;
+
+      // Direction from the crossing to the point = the nearest of N/S/E/W.
+      // This also works for diagonal streets, unlike a fixed N-S / E-W split.
+      const b = turf.bearing(cross.point, snapped);
+      const dir = DIRS.reduce((best, d) => (angleDiff(b, d.bearing) < angleDiff(b, best.bearing) ? d : best)).label;
+      return { street, snapped, cross, dir };
+    }
+
+    let reverseSeq = 0; // ignore responses of older clicks
+
+    async function reverse(lngLat) {
+      const seq = ++reverseSeq;
+      const p = turf.point([lngLat.lng, lngLat.lat]);
+      let loc = locate(p);
+      if (!loc) return show(null, "近くに通りや交差点がありません");
+
+      // Case 1: right at a crossing -> the crossing name, without direction
+      if (turf.distance(p, loc.cross.point) < AT_CROSSING) {
+        const { street, cross } = loc;
+        return show({ streets: [street.geom, streets[cross.name].geom], crossing: cross.point, place: cross.point },
+          `${crossingName(street, streets[cross.name], cross.point)}（交差点）`);
+      }
+
+      // Case 3: inside a block -> snap to the road in front of the building using the
+      // routable point from geocoding (instead of the nearest street), and add the town name
+      let town = "";
+      const inBlock = loc.snapped.properties.dist >= ON_STREET;
+      if (inBlock) {
+        const geo = await geocode(p);
+        if (seq !== reverseSeq) return; // a newer click is in progress
+        town = geo.town;
+        if (geo.routable) loc = locate(geo.routable) ?? loc;
+      }
+
+      // Case 2 (and 3): street + cross + direction (+ town)
+      const { street, snapped, cross, dir } = loc;
+      show({
+        streets: [street.geom, streets[cross.name].geom],
+        block: pathAlong(street, cross.point, snapped),
+        crossing: cross.point,
+        place: inBlock ? p : snapped,
+      }, `${addrName(street.name)}${shortName(cross.name)}${dir}${town}`);
+    }
+
+    // ------------------------------------------------------------
+    // 5. Map and UI
+    // ------------------------------------------------------------
+
+    const map = new mapboxgl.Map({
+      container: "map",
+      style: "mapbox://styles/mapbox/standard",
+      config: { basemap: { theme: "monochrome", showPointOfInterestLabels: false } },
+      language: "ja",
+      center: [135.7596, 35.0037],
+      zoom: 15,
+    });
+
+    const empty = turf.featureCollection([]);
+
+    function show(r, text) {
+      document.getElementById("result").textContent = text;
+      const fc = (features) => turf.featureCollection(features.filter(Boolean));
+      map.getSource("streets").setData(r ? fc(r.streets) : empty);
+      map.getSource("block").setData(r ? fc([r.block]) : empty);
+      map.getSource("points").setData(r ? fc([
+        turf.point(r.crossing.geometry.coordinates, { kind: "crossing" }),
+        turf.point(r.place.geometry.coordinates, { kind: "place" }),
+      ]) : empty);
+      if (r) map.easeTo({ center: r.place.geometry.coordinates });
+    }
+
+    let streets = {};
+    const streetsLoading = loadStreets(); // start fetching tiles while the map loads
+
+    map.on("load", async () => {
+      for (const id of ["loaded", "streets", "block", "points"]) map.addSource(id, { type: "geojson", data: empty });
+      // All loaded streets, so you can see which ones are searchable
+      map.addLayer({
+        id: "loaded", type: "line", source: "loaded", slot: "middle",
+        paint: { "line-color": "#14b8a6", "line-width": 3, "line-opacity": 0.35 },
+      });
+      map.addLayer({
+        id: "streets", type: "line", source: "streets", slot: "middle",
+        paint: { "line-color": "#3b82f6", "line-width": 5, "line-opacity": 0.5 },
+      });
+      map.addLayer({
+        id: "block", type: "line", source: "block", slot: "top",
+        paint: { "line-color": "#e11d48", "line-width": 8 },
+      });
+      map.addLayer({
+        id: "points", type: "circle", source: "points", slot: "top",
+        paint: {
+          "circle-radius": ["match", ["get", "kind"], "place", 9, 6],
+          "circle-color": ["match", ["get", "kind"], "place", "#e11d48", "#fff"],
+          "circle-stroke-color": "#e11d48",
+          "circle-stroke-width": 3,
+        },
+      });
+
+      streets = await streetsLoading;
+      map.getSource("loaded").setData(turf.featureCollection(Object.values(streets).map((s) => s.geom)));
+      document.getElementById("status").textContent =
+        `${Object.keys(streets).length} 本の通りを読み込みました。地図をクリックすると逆引きします。`;
+
+      // Street name suggestions for both inputs
+      document.getElementById("street-names").append(...Object.keys(streets)
+        .map(addrName)
+        .sort((a, b) => a.localeCompare(b, "ja"))
+        .map((name) => new Option(name)));
+
+      map.on("click", (e) => reverse(e.lngLat));
+    });
+
+    const $ = (id) => document.getElementById(id);
+    $("search").addEventListener("submit", (e) => {
+      e.preventDefault();
+      forward($("street").value, $("cross").value, $("dir").value);
+    });
+  </script>
+</body>
+</html>
